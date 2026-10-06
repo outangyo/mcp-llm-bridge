@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from src.orchestrator.adapters import (
+    AGYBuilderAdapter,
     BaseAgentAdapter,
+    GeminiReviewerAdapter,
     MockBuilder,
     MockReviewer,
     ProgressCallback,
+    find_agy_binary,
+    sanitize_secrets,
 )
 from src.orchestrator.cli import CLIRenderer
 from src.orchestrator.contracts import (
@@ -63,6 +67,10 @@ __all__ = [
     "ProgressCallback",
     "MockBuilder",
     "MockReviewer",
+    "AGYBuilderAdapter",
+    "find_agy_binary",
+    "GeminiReviewerAdapter",
+    "sanitize_secrets",
     # CLI & Reporting
     "CLIRenderer",
     "WorkflowSummary",
