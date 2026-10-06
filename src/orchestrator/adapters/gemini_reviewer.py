@@ -28,20 +28,28 @@ def sanitize_secrets(text: str) -> str:
     return text
 
 
+import threading
+
+_GLOBAL_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_LOOP_THREAD: Optional[threading.Thread] = None
+_LOOP_LOCK = threading.Lock()
+
+
+def _get_background_loop() -> asyncio.AbstractEventLoop:
+    global _GLOBAL_LOOP, _LOOP_THREAD
+    with _LOOP_LOCK:
+        if _GLOBAL_LOOP is None or _GLOBAL_LOOP.is_closed():
+            _GLOBAL_LOOP = asyncio.new_event_loop()
+            _LOOP_THREAD = threading.Thread(target=_GLOBAL_LOOP.run_forever, daemon=True)
+            _LOOP_THREAD.start()
+        return _GLOBAL_LOOP
+
+
 def run_async_sync(coro: Any) -> str:
-    """Safely execute an asynchronous coroutine from a synchronous call-site."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, coro).result()
-    else:
-        return asyncio.run(coro)
+    """Safely execute an asynchronous coroutine on a persistent background event loop."""
+    loop = _get_background_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result()
 
 
 class GeminiReviewerAdapter(BaseAgentAdapter):
@@ -170,42 +178,55 @@ Respond with a JSON code block matching this schema:
             callback=progress_callback,
         )
 
-        try:
-            coro = self._provider.generate_text(question=question, context=context_str)
-            raw_response = run_async_sync(coro)
-        except LLMProviderError as exc:
-            safe_err = sanitize_secrets(str(exc))
-            logger.warning("LLM provider error during review turn: %s", safe_err)
-            self.notify_progress(
-                message=f"Review failed: {safe_err}",
-                payload={"error": safe_err},
-                callback=progress_callback,
-            )
-            return AgentReport(
-                agent_role=AgentRole.REVIEWER,
-                agent_name=self.agent_name,
-                summary=f"Review failed due to LLM provider error: {safe_err}",
-                findings=safe_err,
-                reviewer_verdict=ReviewerVerdict.REJECT,
-                blockers=[safe_err],
-                next_step="Check provider configuration or credentials and retry.",
-            )
-        except Exception as exc:
-            safe_err = sanitize_secrets(str(exc))
-            logger.exception("Unexpected exception in Gemini reviewer adapter: %s", safe_err)
-            self.notify_progress(
-                message=f"Review encountered unexpected error: {safe_err}",
-                callback=progress_callback,
-            )
-            return AgentReport(
-                agent_role=AgentRole.REVIEWER,
-                agent_name=self.agent_name,
-                summary=f"Reviewer encountered unexpected error: {safe_err}",
-                findings=safe_err,
-                reviewer_verdict=ReviewerVerdict.REJECT,
-                blockers=[safe_err],
-                next_step="Investigate reviewer adapter error.",
-            )
+        raw_response = None
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                coro = self._provider.generate_text(question=question, context=context_str)
+                raw_response = run_async_sync(coro)
+                break
+            except LLMProviderError as exc:
+                err_text = str(exc)
+                if ("503" in err_text or "429" in err_text or "UNAVAILABLE" in err_text) and attempt < max_attempts - 1:
+                    logger.info("Transient provider error (%s), retrying attempt %s/%s in 3s...", err_text, attempt + 2, max_attempts)
+                    import time
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                safe_err = sanitize_secrets(err_text)
+                logger.warning("LLM provider error during review turn: %s", safe_err)
+                self.notify_progress(
+                    message=f"Review failed: {safe_err}",
+                    payload={"error": safe_err},
+                    callback=progress_callback,
+                )
+                return AgentReport(
+                    agent_role=AgentRole.REVIEWER,
+                    agent_name=self.agent_name,
+                    summary=f"Review failed due to LLM provider error: {safe_err}",
+                    findings=safe_err,
+                    reviewer_verdict=ReviewerVerdict.REJECT,
+                    blockers=[safe_err],
+                    next_step="Check provider configuration or credentials and retry.",
+                )
+            except Exception as exc:
+                safe_err = sanitize_secrets(str(exc))
+                logger.exception("Unexpected exception in Gemini reviewer adapter: %s", safe_err)
+                self.notify_progress(
+                    message=f"Review encountered unexpected error: {safe_err}",
+                    callback=progress_callback,
+                )
+                return AgentReport(
+                    agent_role=AgentRole.REVIEWER,
+                    agent_name=self.agent_name,
+                    summary=f"Reviewer encountered unexpected error: {safe_err}",
+                    findings=safe_err,
+                    reviewer_verdict=ReviewerVerdict.REJECT,
+                    blockers=[safe_err],
+                    next_step="Investigate reviewer adapter error.",
+                )
+
+        if raw_response is None:
+            raw_response = ""
 
         self.notify_progress(
             message="Parsing reviewer verdict and structured findings",

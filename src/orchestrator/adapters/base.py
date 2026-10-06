@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional
 
@@ -7,6 +8,13 @@ from src.orchestrator.contracts.context import WorkflowContext
 from src.orchestrator.contracts.report import AgentReport, AgentRole
 
 ProgressCallback = Callable[[str, Optional[Dict[str, Any]]], None]
+
+
+def sanitize_secrets(text: str) -> str:
+    """Mask potential API keys or tokens from report narratives and error logs."""
+    text = re.sub(r"AIza[0-9A-Za-z-_]{10,}", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"sk-[0-9A-Za-z-_]{10,}", "[REDACTED_API_KEY]", text)
+    return text
 
 
 class BaseAgentAdapter(ABC):

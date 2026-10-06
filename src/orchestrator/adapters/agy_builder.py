@@ -8,7 +8,11 @@ import shutil
 import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
-from src.orchestrator.adapters.base import BaseAgentAdapter, ProgressCallback
+from src.orchestrator.adapters.base import (
+    BaseAgentAdapter,
+    ProgressCallback,
+    sanitize_secrets,
+)
 from src.orchestrator.contracts.context import WorkflowContext
 from src.orchestrator.contracts.report import AgentReport, AgentRole, BuilderResult
 
@@ -92,8 +96,8 @@ ACCEPTANCE CRITERIA:
 {criteria_list}
 {feedback_section}
 INSTRUCTIONS:
-1. Implement the required modifications within the allowed scopes.
-2. Verify changes locally.
+1. You are running in non-interactive print mode. Do not invoke external command/tool actions that require interactive terminal prompts. Formulate your implementation analysis, code adjustments, and report as structured text.
+2. Verify changes against the acceptance criteria within the allowed scopes.
 3. Conclude your response with a JSON report code block matching this schema:
 ```json
 {{
@@ -207,12 +211,12 @@ INSTRUCTIONS:
 
     def _parse_response(self, raw_stdout: str, context: WorkflowContext) -> AgentReport:
         """Parse AGY stdout into typed AgentReport with schema extraction and path policy check."""
-        response_text = raw_stdout.strip()
+        response_text = sanitize_secrets(raw_stdout.strip())
         # Extract response from AGY json envelope if present
         try:
             data = json.loads(raw_stdout)
             if isinstance(data, dict) and "response" in data:
-                response_text = data["response"]
+                response_text = sanitize_secrets(str(data["response"]).strip())
         except Exception:
             pass
 
@@ -226,15 +230,20 @@ INSTRUCTIONS:
         next_step = "Submit to Reviewer for verification."
         modified_files: List[str] = []
 
+        # Check for auto-denied permission actions in headless mode
+        if isinstance(data, dict) and data.get("denied_actions"):
+            builder_result = BuilderResult.BLOCKED
+            blockers.append(f"Permission policy: Headless tool action auto-denied: {data['denied_actions']}")
+
         if extracted_data:
-            summary = str(extracted_data.get("summary", "")).strip()
-            findings = str(extracted_data.get("findings", "")).strip()
+            summary = sanitize_secrets(str(extracted_data.get("summary", "")).strip())
+            findings = sanitize_secrets(str(extracted_data.get("findings", "")).strip())
             res_str = str(extracted_data.get("builder_result", "SUCCESS")).upper().strip()
             builder_result = getattr(BuilderResult, res_str, BuilderResult.SUCCESS)
             raw_blockers = extracted_data.get("blockers", [])
             if isinstance(raw_blockers, list):
-                blockers = [str(b) for b in raw_blockers]
-            next_step = str(extracted_data.get("next_step", next_step)).strip()
+                blockers = [sanitize_secrets(str(b)) for b in raw_blockers]
+            next_step = sanitize_secrets(str(extracted_data.get("next_step", next_step)).strip())
             raw_files = extracted_data.get("modified_files", [])
             if isinstance(raw_files, list):
                 modified_files = [str(f) for f in raw_files]
