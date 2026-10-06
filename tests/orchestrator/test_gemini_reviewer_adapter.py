@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -140,7 +140,7 @@ def test_gemini_reviewer_verdict_request_changes(workflow_context: WorkflowConte
 
 
 def test_gemini_reviewer_fallback_unstructured_response(workflow_context: WorkflowContext):
-    # Reviewer responds in plain conversational text containing verdict keyword
+    # Reviewer responds in plain text containing explicit verdict keyword
     provider = DummyProvider(response_text="I have reviewed the changes. All acceptance criteria PASS.")
     adapter = GeminiReviewerAdapter(provider=provider)
 
@@ -148,7 +148,7 @@ def test_gemini_reviewer_fallback_unstructured_response(workflow_context: Workfl
 
     assert report.reviewer_verdict == ReviewerVerdict.PASS
     assert report.is_pass is True
-    assert "accepted changes" in report.summary.lower()
+    assert "explicitly indicated PASS" in report.summary
 
 
 def test_gemini_reviewer_llm_provider_error_handling(workflow_context: WorkflowContext):
@@ -188,3 +188,91 @@ def test_gemini_reviewer_progress_reporting(workflow_context: WorkflowContext):
     assert any("Assembling review criteria" in m for m in progress_updates)
     assert any("Requesting review" in m for m in progress_updates)
     assert any("Parsing reviewer verdict" in m for m in progress_updates)
+
+
+# ---------------------------------------------------------------------------
+# Focused Fix 1: Provider Factory Preservation Tests
+# ---------------------------------------------------------------------------
+
+def test_gemini_reviewer_adapter_uses_provider_factory():
+    dummy = DummyProvider(response_text="PASS")
+    with patch("src.orchestrator.adapters.gemini_reviewer.create_llm_provider", return_value=dummy) as mock_factory:
+        adapter = GeminiReviewerAdapter()
+        assert adapter.provider is dummy
+        mock_factory.assert_called_once()
+
+
+def test_gemini_reviewer_adapter_handles_factory_failure_safely(workflow_context: WorkflowContext):
+    # When create_llm_provider fails (e.g. missing LLM_PROVIDER), execute() returns safe REJECT report
+    with patch(
+        "src.orchestrator.adapters.gemini_reviewer.create_llm_provider",
+        side_effect=LLMProviderError("LLM_PROVIDER is not configured."),
+    ):
+        adapter = GeminiReviewerAdapter()
+        assert adapter.provider is None
+
+        report = adapter.execute(workflow_context)
+        assert report.agent_role == AgentRole.REVIEWER
+        assert report.reviewer_verdict == ReviewerVerdict.REJECT
+        assert report.is_pass is False
+        assert "Provider initialization error" in report.summary
+        assert "LLM_PROVIDER is not configured" in report.findings
+        assert "ProviderInitializationError" in report.blockers[0]
+
+
+# ---------------------------------------------------------------------------
+# Focused Fix 2: Fail-Closed Parsing Tests
+# ---------------------------------------------------------------------------
+
+def test_gemini_reviewer_fails_closed_on_empty_response(workflow_context: WorkflowContext):
+    provider = DummyProvider(response_text="")
+    adapter = GeminiReviewerAdapter(provider=provider)
+
+    report = adapter.execute(workflow_context)
+    assert report.reviewer_verdict == ReviewerVerdict.REJECT
+    assert report.is_pass is False
+    assert "Empty response" in report.findings
+    assert "Reviewer response could not be parsed into a valid verdict." in report.blockers
+
+
+def test_gemini_reviewer_fails_closed_on_ambiguous_text(workflow_context: WorkflowContext):
+    # Reviewer output has no recognizable verdict keyword
+    ambiguous_text = "The code looks interesting. I inspected the functions and they seem to work as described."
+    provider = DummyProvider(response_text=ambiguous_text)
+    adapter = GeminiReviewerAdapter(provider=provider)
+
+    report = adapter.execute(workflow_context)
+    assert report.reviewer_verdict == ReviewerVerdict.REJECT
+    assert report.is_pass is False
+    assert "could not be parsed into a valid verdict" in report.summary
+    assert "Reviewer response could not be parsed into a valid verdict." in report.blockers
+
+
+def test_gemini_reviewer_fails_closed_on_conflicting_verdict_keywords(workflow_context: WorkflowContext):
+    # Conflicting keywords: both PASS and REJECT are present
+    conflicting_text = "We should PASS the style checks, but REJECT the logic changes."
+    provider = DummyProvider(response_text=conflicting_text)
+    adapter = GeminiReviewerAdapter(provider=provider)
+
+    report = adapter.execute(workflow_context)
+    assert report.reviewer_verdict == ReviewerVerdict.REJECT
+    assert report.is_pass is False
+    assert any("Conflicting verdict keywords" in b for b in report.blockers)
+
+
+def test_gemini_reviewer_fails_closed_on_invalid_structured_verdict(workflow_context: WorkflowContext):
+    # JSON has invalid verdict string like 'APPROVE' or 'MAYBE'
+    invalid_json = json.dumps({
+        "reviewer_verdict": "APPROVE",
+        "summary": "Looks good",
+        "findings": "Approved",
+        "blockers": [],
+        "next_step": "Done",
+    })
+    provider = DummyProvider(response_text=invalid_json)
+    adapter = GeminiReviewerAdapter(provider=provider)
+
+    report = adapter.execute(workflow_context)
+    assert report.reviewer_verdict == ReviewerVerdict.REJECT
+    assert report.is_pass is False
+    assert any("Unrecognized structured reviewer verdict" in b for b in report.blockers)

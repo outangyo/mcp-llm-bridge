@@ -15,7 +15,6 @@ from src.orchestrator.contracts.report import (
 )
 from src.providers.base import BaseLLMProvider, LLMProviderError
 from src.providers.factory import create_llm_provider
-from src.providers.gemini import GeminiProvider
 
 logger = logging.getLogger(__name__)
 
@@ -47,28 +46,33 @@ def run_async_sync(coro: Any) -> str:
 
 class GeminiReviewerAdapter(BaseAgentAdapter):
     """
-    Real Reviewer adapter delegating code and artifact evaluation to Google Gemini
-    via the existing M2 LLM provider abstraction (GeminiProvider / BaseLLMProvider).
+    Real Reviewer adapter delegating code and artifact evaluation to an LLM
+    via the canonical M2 provider factory (create_llm_provider() / BaseLLMProvider).
+    Strictly preserves the provider abstraction boundary and enforces fail-closed parsing.
     """
 
     def __init__(
         self,
         agent_name: str = "Gemini",
         provider: Optional[BaseLLMProvider] = None,
-        model: Optional[str] = None,
     ) -> None:
         super().__init__(agent_name=agent_name, agent_role=AgentRole.REVIEWER)
-        if provider is not None:
-            self._provider = provider
-        else:
+        self._provider: Optional[BaseLLMProvider] = provider
+        self._provider_init_error: Optional[str] = None
+
+        if self._provider is None:
             try:
                 self._provider = create_llm_provider()
-            except Exception:
-                self._provider = GeminiProvider(model=model)
+            except Exception as exc:
+                self._provider_init_error = sanitize_secrets(str(exc))
+                logger.warning(
+                    "create_llm_provider() failed during Reviewer adapter initialization: %s",
+                    self._provider_init_error,
+                )
 
     @property
-    def provider(self) -> BaseLLMProvider:
-        """The underlying LLM provider instance."""
+    def provider(self) -> Optional[BaseLLMProvider]:
+        """The underlying LLM provider instance, if successfully resolved."""
         return self._provider
 
     def build_review_context(self, context: WorkflowContext) -> tuple[str, str]:
@@ -137,6 +141,28 @@ Respond with a JSON code block matching this schema:
             callback=progress_callback,
         )
 
+        # Enforce provider factory resolution without bypassing abstraction
+        if self._provider is None:
+            # Re-attempt in case environment changed dynamically
+            if not self._provider_init_error:
+                try:
+                    self._provider = create_llm_provider()
+                except Exception as exc:
+                    self._provider_init_error = sanitize_secrets(str(exc))
+
+            if self._provider is None:
+                err_msg = self._provider_init_error or "LLM provider could not be initialized from create_llm_provider()."
+                logger.error("Reviewer adapter execution halted due to provider initialization error: %s", err_msg)
+                return AgentReport(
+                    agent_role=AgentRole.REVIEWER,
+                    agent_name=self.agent_name,
+                    summary=f"Review failed: Provider initialization error ({err_msg})",
+                    findings=err_msg,
+                    reviewer_verdict=ReviewerVerdict.REJECT,
+                    blockers=[f"ProviderInitializationError: {err_msg}"],
+                    next_step="Configure LLM_PROVIDER or supply a valid provider instance.",
+                )
+
         question, context_str = self.build_review_context(context)
 
         self.notify_progress(
@@ -189,60 +215,105 @@ Respond with a JSON code block matching this schema:
         return self._parse_reviewer_response(raw_response)
 
     def _parse_reviewer_response(self, raw_response: str) -> AgentReport:
-        """Parse provider response into typed AgentReport."""
+        """
+        Parse provider response into typed AgentReport.
+        Strictly enforces 'fail-closed' semantics:
+        Any malformed, empty, or ambiguous response defaults to REJECT.
+        """
         sanitized = sanitize_secrets(raw_response.strip())
+        if not sanitized:
+            return AgentReport(
+                agent_role=AgentRole.REVIEWER,
+                agent_name=self.agent_name,
+                summary="Review failed: Provider returned an empty response.",
+                findings="Empty response body received from LLM provider.",
+                reviewer_verdict=ReviewerVerdict.REJECT,
+                blockers=["Reviewer response could not be parsed into a valid verdict."],
+                next_step="Reviewer must re-evaluate and provide a valid structured report.",
+                artifacts={"raw_response": ""},
+            )
+
         extracted = self._extract_json_block(sanitized)
 
-        verdict = ReviewerVerdict.PASS
+        verdict: Optional[ReviewerVerdict] = None
         summary = ""
         findings = ""
         blockers: List[str] = []
-        next_step = "Proceed to final PO approval or next iteration."
+        next_step = ""
 
-        if extracted:
-            v_str = str(extracted.get("reviewer_verdict", "PASS")).upper().strip()
-            if v_str == "PASS":
+        if extracted and isinstance(extracted, dict):
+            raw_v = str(extracted.get("reviewer_verdict", "")).strip().upper()
+            if raw_v == "PASS":
                 verdict = ReviewerVerdict.PASS
-            elif v_str == "REJECT":
+            elif raw_v == "REJECT":
                 verdict = ReviewerVerdict.REJECT
-            elif v_str in ("REQUEST_CHANGES", "REQUESTCHANGES"):
+            elif raw_v in ("REQUEST_CHANGES", "REQUESTCHANGES"):
                 verdict = ReviewerVerdict.REQUEST_CHANGES
             else:
                 verdict = ReviewerVerdict.REJECT
+                blockers.append(f"Unrecognized structured reviewer verdict: '{raw_v}'.")
 
             summary = str(extracted.get("summary", "")).strip()
             findings = str(extracted.get("findings", "")).strip()
             raw_b = extracted.get("blockers", [])
             if isinstance(raw_b, list):
-                blockers = [str(b) for b in raw_b]
-            next_step = str(extracted.get("next_step", next_step)).strip()
+                for b in raw_b:
+                    b_str = str(b).strip()
+                    if b_str and b_str not in blockers:
+                        blockers.append(b_str)
+            next_step = str(extracted.get("next_step", "")).strip()
 
-        if not summary:
-            # Fallback heuristic if no structured JSON could be parsed
+        # If no valid structured verdict was extracted, evaluate explicit unstructured format
+        if verdict is None:
+            # Fail closed: Only accept explicit, unambiguous verdict keywords
             upper_raw = sanitized.upper()
-            if "REJECT" in upper_raw:
-                verdict = ReviewerVerdict.REJECT
-                summary = "Reviewer rejected changes based on unstructured response."
-            elif "REQUEST_CHANGES" in upper_raw or "CHANGES REQUESTED" in upper_raw:
-                verdict = ReviewerVerdict.REQUEST_CHANGES
-                summary = "Reviewer requested changes based on unstructured response."
-            else:
-                verdict = ReviewerVerdict.PASS
-                summary = "Reviewer accepted changes based on unstructured response."
-            findings = sanitized[:1000]
+            has_pass = bool(re.search(r"\b(PASS|VERDICT:\s*PASS)\b", upper_raw))
+            has_reject = bool(re.search(r"\b(REJECT|VERDICT:\s*REJECT)\b", upper_raw))
+            has_changes = bool(re.search(r"\b(REQUEST_CHANGES|REQUEST\s+CHANGES|CHANGES\s+REQUESTED)\b", upper_raw))
 
+            # Exactly one unambiguous verdict must be present
+            matched_verdicts = sum([has_pass, has_reject, has_changes])
+            if matched_verdicts == 1:
+                if has_pass:
+                    verdict = ReviewerVerdict.PASS
+                    summary = "Reviewer explicitly indicated PASS in unstructured response."
+                elif has_reject:
+                    verdict = ReviewerVerdict.REJECT
+                    summary = "Reviewer explicitly indicated REJECT in unstructured response."
+                elif has_changes:
+                    verdict = ReviewerVerdict.REQUEST_CHANGES
+                    summary = "Reviewer explicitly requested changes in unstructured response."
+                findings = sanitized[:1000]
+            else:
+                # Ambiguous, conflicting, or missing verdict -> FAIL CLOSED TO REJECT
+                verdict = ReviewerVerdict.REJECT
+                summary = "Review failed: Reviewer response could not be parsed into a valid verdict."
+                findings = sanitized[:1000]
+                blockers.append("Reviewer response could not be parsed into a valid verdict.")
+                if matched_verdicts > 1:
+                    blockers.append("Conflicting verdict keywords detected in reviewer response.")
+
+        # Ensure summary is populated
+        if not summary:
+            if verdict == ReviewerVerdict.REJECT and blockers and "could not be parsed" in blockers[0]:
+                summary = "Review failed: Reviewer response could not be parsed into a valid verdict."
+            else:
+                summary = f"Reviewer completed evaluation with verdict {verdict.value}."
+
+        # Ensure next_step is populated
         if not next_step:
-            next_step = (
-                "Proceed to PO approval sign-off."
-                if verdict == ReviewerVerdict.PASS
-                else "Builder must revise implementation according to findings."
-            )
+            if verdict == ReviewerVerdict.PASS:
+                next_step = "Proceed to PO final approval sign-off."
+            elif verdict == ReviewerVerdict.REQUEST_CHANGES:
+                next_step = "Builder must revise implementation according to reviewer findings."
+            else:
+                next_step = "Builder or PO must review blockers and address reviewer rejection."
 
         return AgentReport(
             agent_role=AgentRole.REVIEWER,
             agent_name=self.agent_name,
             summary=summary,
-            findings=findings,
+            findings=findings or sanitized[:1000],
             reviewer_verdict=verdict,
             blockers=blockers,
             next_step=next_step,
