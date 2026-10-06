@@ -12,7 +12,12 @@ from src.orchestrator.adapters.mock_builder import MockBuilder
 from src.orchestrator.adapters.mock_reviewer import MockReviewer
 from src.orchestrator.cli.renderer import CLIRenderer
 from src.orchestrator.contracts.context import WorkflowContext
-from src.orchestrator.contracts.task import TaskBudget, TaskContract
+from src.orchestrator.contracts.task import (
+    TaskBudget,
+    TaskContract,
+    normalize_task_input,
+)
+
 from src.orchestrator.engine import OrchestratorEngine
 from src.orchestrator.policy.execution_policy import ExecutionPolicy, PolicyMode
 
@@ -28,22 +33,8 @@ def parse_task_input(task_input: str) -> TaskContract:
     Parse task definition from a JSON file path or inline JSON string into TaskContract.
     Raises ValueError with safe error message if parsing or validation fails.
     """
-    cleaned = task_input.strip()
-    if os.path.isfile(cleaned):
-        try:
-            with open(cleaned, "r", encoding="utf-8") as f:
-                content = f.read()
-            return TaskContract.model_validate_json(content)
-        except Exception as exc:
-            raise ValueError(f"Failed to load task file '{cleaned}': {exc}") from exc
+    return normalize_task_input(task_input=task_input)
 
-    # Attempt parsing as inline JSON string
-    try:
-        return TaskContract.model_validate_json(cleaned)
-    except Exception as exc:
-        raise ValueError(
-            f"Input is neither a valid file path nor a valid TaskContract JSON string: {exc}"
-        ) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,25 +58,25 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--criteria",
         action="append",
-        default=[],
+        default=None,
         help="Verifiable acceptance criteria (repeatable)",
     )
     run_parser.add_argument(
         "--allowed-paths",
         action="append",
-        default=[],
+        default=None,
         help="Scoped filesystem paths the builder may touch (repeatable)",
     )
     run_parser.add_argument(
         "--max-iterations",
         type=int,
-        default=3,
+        default=None,
         help="Maximum allowed iteration loops (default: 3)",
     )
     run_parser.add_argument(
         "--max-retries",
         type=int,
-        default=2,
+        default=None,
         help="Maximum allowed retries on reviewer rejection (default: 2)",
     )
     run_parser.add_argument(
@@ -149,35 +140,21 @@ def main(
 
     # 1. Resolve and validate TaskContract
     task: TaskContract
-    if args.task_input:
-        try:
-            task = parse_task_input(args.task_input)
-        except Exception as exc:
-            safe_err = sanitize_secrets(str(exc))
-            sys.stderr.write(f"Error: {safe_err}\n")
-            return EXIT_INVALID_INPUT
-    elif args.title and args.description:
-        try:
-            task = TaskContract(
-                title=args.title,
-                description=args.description,
-                acceptance_criteria=args.criteria,
-                allowed_paths=args.allowed_paths,
-                budget=TaskBudget(
-                    max_iterations=args.max_iterations,
-                    max_retries=args.max_retries,
-                ),
-            )
-        except Exception as exc:
-            safe_err = sanitize_secrets(str(exc))
-            sys.stderr.write(f"Error creating task contract: {safe_err}\n")
-            return EXIT_INVALID_INPUT
-    else:
-        sys.stderr.write(
-            "Error: Must provide either a task definition (file path or JSON string) "
-            "or both --title and --description.\n"
+    try:
+        task = normalize_task_input(
+            task_input=args.task_input,
+            title=args.title,
+            description=args.description,
+            criteria=args.criteria,
+            allowed_paths=args.allowed_paths,
+            max_iterations=args.max_iterations,
+            max_retries=args.max_retries,
         )
+    except Exception as exc:
+        safe_err = sanitize_secrets(str(exc))
+        sys.stderr.write(f"Task validation error: {safe_err}\n")
         return EXIT_INVALID_INPUT
+
 
     # 2. Configure execution policy
     policy_mode = PolicyMode[args.policy.upper()]

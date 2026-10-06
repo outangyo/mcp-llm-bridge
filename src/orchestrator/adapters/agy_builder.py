@@ -15,6 +15,7 @@ from src.orchestrator.adapters.base import (
 )
 from src.orchestrator.contracts.context import WorkflowContext
 from src.orchestrator.contracts.report import AgentReport, AgentRole, BuilderResult
+from src.orchestrator.security.paths import is_path_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -259,18 +260,14 @@ INSTRUCTIONS:
 
         # Path Scope Security Enforcement
         if context.task.allowed_paths and modified_files:
-            violating_files = []
-            for f in modified_files:
-                norm_f = f.replace("\\", "/").strip().lower()
-                allowed = any(
-                    norm_f.startswith(p.replace("\\", "/").strip().lower())
-                    for p in context.task.allowed_paths
-                )
-                if not allowed:
-                    violating_files.append(f)
+            violating_files = [
+                f for f in modified_files
+                if not is_path_allowed(f, context.task.allowed_paths)
+            ]
 
             if violating_files:
                 builder_result = BuilderResult.BLOCKED
+
                 blocker_msg = (
                     f"Path policy violation: files modified outside allowed scope "
                     f"{context.task.allowed_paths}: {violating_files}"

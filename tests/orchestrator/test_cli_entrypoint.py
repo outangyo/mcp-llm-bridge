@@ -75,11 +75,12 @@ def test_build_parser_defaults() -> None:
     assert args.subcommand == "run"
     assert args.task_input == "task.json"
     assert args.policy == "SUPERVISED"
-    assert args.max_iterations == 3
-    assert args.max_retries == 2
+    assert args.max_iterations is None
+    assert args.max_retries is None
     assert not args.mock
     assert not args.auto_approve
     assert not args.no_icons
+
 
 
 def test_parse_task_input_from_valid_file(tmp_path: Any) -> None:
@@ -103,11 +104,13 @@ def test_parse_task_input_from_inline_json() -> None:
     raw_json = json.dumps({
         "title": "Inline Task",
         "description": "Task directly from JSON string",
+        "acceptance_criteria": ["Criteria 1"],
     })
     contract = parse_task_input(raw_json)
     assert isinstance(contract, TaskContract)
     assert contract.title == "Inline Task"
     assert contract.description == "Task directly from JSON string"
+    assert contract.acceptance_criteria == ["Criteria 1"]
 
 
 def test_parse_task_input_invalid_json() -> None:
@@ -154,20 +157,24 @@ def test_cli_missing_task_definition(capsys: pytest.CaptureFixture[str]) -> None
     code = main(["run"])
     assert code == EXIT_INVALID_INPUT
     captured = capsys.readouterr()
-    assert "must provide either a task definition" in captured.err.lower()
+    assert "error" in captured.err.lower()
 
 
 def test_cli_partial_flags_missing_description(capsys: pytest.CaptureFixture[str]) -> None:
     code = main(["run", "--title", "Task Without Description"])
     assert code == EXIT_INVALID_INPUT
     captured = capsys.readouterr()
-    assert "must provide either a task definition" in captured.err.lower()
+    assert "error" in captured.err.lower()
 
 
 def test_cli_run_from_file_success(tmp_path: Any) -> None:
     task_file = tmp_path / "valid_task.json"
     task_file.write_text(
-        json.dumps({"title": "File Task", "description": "Run from file test"}),
+        json.dumps({
+            "title": "File Task",
+            "description": "Run from file test",
+            "acceptance_criteria": ["Criteria 1"],
+        }),
         encoding="utf-8",
     )
 
@@ -184,7 +191,11 @@ def test_cli_run_from_file_success(tmp_path: Any) -> None:
 
 
 def test_cli_run_from_inline_json_success() -> None:
-    inline_json = json.dumps({"title": "Inline Task", "description": "Run from inline"})
+    inline_json = json.dumps({
+        "title": "Inline Task",
+        "description": "Run from inline",
+        "acceptance_criteria": ["Criteria 1"],
+    })
 
     captured_engine: Dict[str, Any] = {}
 
@@ -195,6 +206,7 @@ def test_cli_run_from_inline_json_success() -> None:
     code = main(["run", inline_json], engine_factory=factory)
     assert code == EXIT_SUCCESS
     assert captured_engine["task"].title == "Inline Task"
+
 
 
 def test_cli_run_from_flags_success() -> None:
@@ -236,7 +248,7 @@ def test_cli_workflow_failure_exit_code() -> None:
     def factory(**kwargs: Any) -> FakeEngine:
         return FakeEngine(**kwargs, summary_status="FAILED")
 
-    argv = ["run", "--title", "Failing Task", "--description", "Desc"]
+    argv = ["run", "--title", "Failing Task", "--description", "Desc", "--criteria", "Test criteria"]
     code = main(argv, engine_factory=factory)
     assert code == EXIT_FAILED
 
@@ -245,7 +257,7 @@ def test_cli_workflow_stopped_exit_code() -> None:
     def factory(**kwargs: Any) -> FakeEngine:
         return FakeEngine(**kwargs, summary_status="STOPPED")
 
-    argv = ["run", "--title", "Stopped Task", "--description", "Desc"]
+    argv = ["run", "--title", "Stopped Task", "--description", "Desc", "--criteria", "Test criteria"]
     code = main(argv, engine_factory=factory)
     assert code == EXIT_STOPPED
 
@@ -254,7 +266,7 @@ def test_cli_workflow_runtime_exception(capsys: pytest.CaptureFixture[str]) -> N
     def factory(**kwargs: Any) -> FakeEngine:
         return FakeEngine(**kwargs, raise_exc=RuntimeError("Engine crashed unexpectedly"))
 
-    argv = ["run", "--title", "Crash Task", "--description", "Desc"]
+    argv = ["run", "--title", "Crash Task", "--description", "Desc", "--criteria", "Test criteria"]
     code = main(argv, engine_factory=factory)
     assert code == EXIT_FAILED
     captured = capsys.readouterr()
@@ -265,7 +277,7 @@ def test_cli_keyboard_interrupt(capsys: pytest.CaptureFixture[str]) -> None:
     def factory(**kwargs: Any) -> FakeEngine:
         return FakeEngine(**kwargs, raise_exc=KeyboardInterrupt())
 
-    argv = ["run", "--title", "Interrupt Task", "--description", "Desc"]
+    argv = ["run", "--title", "Interrupt Task", "--description", "Desc", "--criteria", "Test criteria"]
     code = main(argv, engine_factory=factory)
     assert code == EXIT_STOPPED
     captured = capsys.readouterr()
@@ -283,7 +295,7 @@ def test_cli_approval_handler_auto_approve() -> None:
         captured_engine.update(kwargs)
         return FakeEngine(**kwargs, summary_status="COMPLETED")
 
-    argv = ["run", "--title", "Task", "--description", "Desc", "--auto-approve"]
+    argv = ["run", "--title", "Task", "--description", "Desc", "--criteria", "Test criteria", "--auto-approve"]
     main(argv, engine_factory=factory)
 
     handler = captured_engine["approval_handler"]
@@ -298,7 +310,7 @@ def test_cli_approval_handler_autonomous_policy() -> None:
         captured_engine.update(kwargs)
         return FakeEngine(**kwargs, summary_status="COMPLETED")
 
-    argv = ["run", "--title", "Task", "--description", "Desc", "--policy", "AUTONOMOUS"]
+    argv = ["run", "--title", "Task", "--description", "Desc", "--criteria", "Test criteria", "--policy", "AUTONOMOUS"]
     main(argv, engine_factory=factory)
 
     handler = captured_engine["approval_handler"]
@@ -313,7 +325,7 @@ def test_cli_approval_handler_interactive_yes() -> None:
         captured_engine.update(kwargs)
         return FakeEngine(**kwargs, summary_status="COMPLETED")
 
-    argv = ["run", "--title", "Task", "--description", "Desc"]
+    argv = ["run", "--title", "Task", "--description", "Desc", "--criteria", "Test criteria"]
     main(argv, engine_factory=factory, input_func=lambda prompt: "y")
 
     handler = captured_engine["approval_handler"]
@@ -328,7 +340,7 @@ def test_cli_approval_handler_interactive_no() -> None:
         captured_engine.update(kwargs)
         return FakeEngine(**kwargs, summary_status="COMPLETED")
 
-    argv = ["run", "--title", "Task", "--description", "Desc"]
+    argv = ["run", "--title", "Task", "--description", "Desc", "--criteria", "Test criteria"]
     main(argv, engine_factory=factory, input_func=lambda prompt: "n")
 
     handler = captured_engine["approval_handler"]
@@ -346,7 +358,7 @@ def test_cli_approval_handler_interactive_eof() -> None:
     def raise_eof(prompt: str) -> str:
         raise EOFError("No stdin")
 
-    argv = ["run", "--title", "Task", "--description", "Desc"]
+    argv = ["run", "--title", "Task", "--description", "Desc", "--criteria", "Test criteria"]
     main(argv, engine_factory=factory, input_func=raise_eof)
 
     handler = captured_engine["approval_handler"]
@@ -360,7 +372,7 @@ def test_cli_approval_handler_interactive_eof() -> None:
 
 def test_cli_secret_sanitized_on_task_load_error(capsys: pytest.CaptureFixture[str]) -> None:
     secret_key = "AIzaSyDummySecretKey12345678901234"
-    invalid_input = f'{{"title": "Secret Task", "description": "Desc", "budget": "{secret_key}"}}'
+    invalid_input = f'{{"title": "Secret Task", "description": "Desc", "acceptance_criteria": ["C1"], "budget": "{secret_key}"}}'
 
     code = main(["run", invalid_input])
     assert code == EXIT_INVALID_INPUT
@@ -376,9 +388,10 @@ def test_cli_secret_sanitized_on_runtime_error(capsys: pytest.CaptureFixture[str
     def factory(**kwargs: Any) -> FakeEngine:
         return FakeEngine(**kwargs, raise_exc=RuntimeError(f"API Failed: {secret_key}"))
 
-    argv = ["run", "--title", "Task", "--description", "Desc"]
+    argv = ["run", "--title", "Task", "--description", "Desc", "--criteria", "Test criteria"]
     code = main(argv, engine_factory=factory)
     assert code == EXIT_FAILED
+
 
     captured = capsys.readouterr()
     assert secret_key not in captured.err

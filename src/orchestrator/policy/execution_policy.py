@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from src.orchestrator.contracts.context import WorkflowContext
 from src.orchestrator.contracts.report import AgentReport
+from src.orchestrator.security.paths import is_path_allowed
 
 
 class PolicyMode(str, Enum):
@@ -125,13 +126,7 @@ class ExecutionPolicy:
         if not allowed_paths:
             return PolicyDecision(allowed=True, requires_human_approval=False, reason="No path restrictions active.")
 
-        normalized_target = target_path.replace("\\", "/").strip().lower()
-        is_allowed = any(
-            normalized_target.startswith(p.replace("\\", "/").strip().lower())
-            for p in allowed_paths
-        )
-
-        if not is_allowed:
+        if not is_path_allowed(target_path, allowed_paths):
             return PolicyDecision(
                 allowed=False,
                 requires_human_approval=False,
@@ -139,3 +134,4 @@ class ExecutionPolicy:
             )
 
         return PolicyDecision(allowed=True, requires_human_approval=False, reason="Path is within permitted scope.")
+
