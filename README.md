@@ -115,17 +115,6 @@ Run the test suite using `pytest`:
 
 ---
 
-## Project State
-```text
-M0 Environment Setup                 CLOSED ✅
-M1 Minimal MCP Bridge                CLOSED ✅
-M2 Provider Abstraction              CLOSED ✅
-M2 Mock LLM Integration              CLOSED ✅
-M2 Real Gemini API E2E               CLOSED ✅
-M3 Multi-Agent Orchestration         NOT STARTED ⏳
-```
-
----
 
 ## Known Limitations
 * **Single Public Tool**: `ask_gpt` is retained as the public MCP tool name for backward compatibility across all providers.
